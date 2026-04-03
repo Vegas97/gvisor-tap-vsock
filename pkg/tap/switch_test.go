@@ -1,0 +1,174 @@
+package tap
+
+import (
+	"errors"
+	"net"
+	"sync/atomic"
+	"testing"
+
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+)
+
+// mockConn implements net.Conn with a controllable Write.
+type mockConn struct {
+	net.Conn // embed for unimplemented methods
+	written  [][]byte
+	writeErr error
+}
+
+func (m *mockConn) Write(b []byte) (int, error) {
+	if m.writeErr != nil {
+		return 0, m.writeErr
+	}
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	m.written = append(m.written, cp)
+	return len(b), nil
+}
+
+func (m *mockConn) Close() error { return nil }
+
+func (m *mockConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+func (m *mockConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+// makeBroadcastFrame builds a minimal Ethernet frame with broadcast destination.
+func makeBroadcastFrame(srcMAC net.HardwareAddr) []byte {
+	frame := make([]byte, header.EthernetMinimumSize)
+	// Destination: broadcast (ff:ff:ff:ff:ff:ff)
+	copy(frame[0:6], header.EthernetBroadcastAddress)
+	// Source
+	copy(frame[6:12], srcMAC)
+	// EtherType: IPv4
+	frame[12] = 0x08
+	frame[13] = 0x00
+	return frame
+}
+
+func TestBroadcast_ContinuesAfterOneConnFails(t *testing.T) {
+	// Given 3 connections where conn #1 has a broken writer
+	// When a broadcast packet is sent
+	// Then conn #0 and #2 should still receive the frame
+
+	sw := NewSwitch(false)
+
+	conn0 := &mockConn{}
+	conn1 := &mockConn{writeErr: errors.New("broken pipe")}
+	conn2 := &mockConn{}
+
+	// Register 3 connections using bess protocol (non-stream, simplest)
+	bessProto := &bessProtocol{}
+	sw.conns[0] = protocolConn{Conn: conn0, protocolImpl: bessProto}
+	sw.conns[1] = protocolConn{Conn: conn1, protocolImpl: bessProto}
+	sw.conns[2] = protocolConn{Conn: conn2, protocolImpl: bessProto}
+
+	// Source MAC doesn't match any conn (so no conn is skipped as source)
+	srcMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x99}
+	frame := makeBroadcastFrame(srcMAC)
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(frame),
+	})
+	defer pkt.DecRef()
+
+	err := sw.txPkt(pkt)
+	if err != nil {
+		t.Fatalf("txPkt returned error: %v (broadcast should not abort on single conn failure)", err)
+	}
+
+	// conn0 should have received the frame
+	if len(conn0.written) != 1 {
+		t.Errorf("conn0: expected 1 write, got %d", len(conn0.written))
+	}
+
+	// conn1 failed — that's expected, it should have been disconnected
+	if _, exists := sw.conns[1]; exists {
+		t.Error("conn1 should have been removed from conns after write failure")
+	}
+
+	// conn2 should have received the frame despite conn1's failure
+	if len(conn2.written) != 1 {
+		t.Errorf("conn2: expected 1 write, got %d — broadcast aborted after conn1 failure", len(conn2.written))
+	}
+
+	// Sent counter should reflect 2 successful deliveries
+	expectedSent := uint64(len(frame) * 2)
+	if atomic.LoadUint64(&sw.Sent) != expectedSent {
+		t.Errorf("Sent: expected %d, got %d", expectedSent, atomic.LoadUint64(&sw.Sent))
+	}
+}
+
+func TestBroadcast_SkipsSourceConn(t *testing.T) {
+	// The source connection should NOT receive its own broadcast
+
+	sw := NewSwitch(false)
+
+	conn0 := &mockConn{}
+	conn1 := &mockConn{}
+
+	bessProto := &bessProtocol{}
+	sw.conns[0] = protocolConn{Conn: conn0, protocolImpl: bessProto}
+	sw.conns[1] = protocolConn{Conn: conn1, protocolImpl: bessProto}
+
+	// Source MAC maps to conn0 via CAM table
+	srcMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	sw.cam["\x02\x00\x00\x00\x00\x01"] = 0
+
+	frame := makeBroadcastFrame(srcMAC)
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(frame),
+	})
+	defer pkt.DecRef()
+
+	err := sw.txPkt(pkt)
+	if err != nil {
+		t.Fatalf("txPkt returned error: %v", err)
+	}
+
+	// conn0 is the source — should NOT receive the broadcast
+	if len(conn0.written) != 0 {
+		t.Errorf("conn0 (source): expected 0 writes, got %d", len(conn0.written))
+	}
+
+	// conn1 should receive it
+	if len(conn1.written) != 1 {
+		t.Errorf("conn1: expected 1 write, got %d", len(conn1.written))
+	}
+}
+
+func TestUnicast_StillReturnsErrorOnFailure(t *testing.T) {
+	// Unicast behavior should NOT change — errors should still propagate
+
+	sw := NewSwitch(false)
+
+	conn0 := &mockConn{writeErr: errors.New("broken pipe")}
+
+	bessProto := &bessProtocol{}
+	sw.conns[0] = protocolConn{Conn: conn0, protocolImpl: bessProto}
+
+	// Set up CAM entry for unicast destination
+	dstMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	sw.cam["\x02\x00\x00\x00\x00\x01"] = 0
+
+	// Build unicast frame (not broadcast)
+	frame := make([]byte, header.EthernetMinimumSize)
+	copy(frame[0:6], dstMAC)
+	copy(frame[6:12], net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x99})
+	frame[12] = 0x08
+	frame[13] = 0x00
+
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(frame),
+	})
+	defer pkt.DecRef()
+
+	err := sw.txPkt(pkt)
+	if err == nil {
+		t.Fatal("unicast to broken conn should return error, got nil")
+	}
+}

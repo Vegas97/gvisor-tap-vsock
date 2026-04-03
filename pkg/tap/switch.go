@@ -146,9 +146,9 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
 				continue
 			}
 
-			err := e.txBuf(id, conn, buf)
-			if err != nil {
-				return err
+			if err := e.txBuf(id, conn, buf); err != nil {
+				log.Errorf("broadcast write to conn %d failed: %s", id, err)
+				continue
 			}
 
 			atomic.AddUint64(&e.Sent, uint64(size))
