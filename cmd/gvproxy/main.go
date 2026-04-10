@@ -226,14 +226,11 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
 			return os.Remove(config.Interfaces.Qemu)
 		})
 
-		g.Go(func() error {
-			conn, err := qemuListener.Accept()
-			if err != nil {
-				notificationSender.Send(types.NotificationMessage{NotificationType: types.HypervisorError})
-				return fmt.Errorf("qemu accept error: %w", err)
-			}
-			return vn.AcceptQemu(ctx, conn)
-		})
+		go func() {
+			acceptMultiple(ctx, qemuListener, func(ctx context.Context, conn net.Conn) error {
+				return vn.AcceptQemu(ctx, conn)
+			})
+		}()
 	}
 
 	if config.Interfaces.Bess != "" {
@@ -251,14 +248,11 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
 			return os.Remove(config.Interfaces.Bess)
 		})
 
-		g.Go(func() error {
-			conn, err := bessListener.Accept()
-			if err != nil {
-				notificationSender.Send(types.NotificationMessage{NotificationType: types.HypervisorError})
-				return fmt.Errorf("bess accept error: %w", err)
-			}
-			return vn.AcceptBess(ctx, conn)
-		})
+		go func() {
+			acceptMultiple(ctx, bessListener, func(ctx context.Context, conn net.Conn) error {
+				return vn.AcceptBess(ctx, conn)
+			})
+		}()
 	}
 
 	if config.Interfaces.Vfkit != "" {
