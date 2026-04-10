@@ -141,6 +141,7 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
 			srcID = -1
 		}
 		e.camLock.RUnlock()
+		log.Debugf("txPkt: broadcast from %s (connID=%d), flooding to %d conns", src, srcID, len(e.conns))
 		for id, conn := range e.conns {
 			if id == srcID {
 				continue
@@ -158,9 +159,11 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
 		id, ok := e.cam[dst]
 		if !ok {
 			e.camLock.RUnlock()
+			log.Debugf("txPkt: unicast dst=%s NOT in CAM, dropping frame", dst)
 			return nil
 		}
 		e.camLock.RUnlock()
+		log.Debugf("txPkt: unicast dst=%s → conn %d", dst, id)
 		conn := e.conns[id]
 		err := e.txBuf(id, conn, buf)
 		if err != nil {
@@ -285,7 +288,9 @@ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
 	e.cam[eth.SourceAddress()] = id
 	e.camLock.Unlock()
 
-	if exists && oldID != id {
+	if !exists {
+		log.Infof("CAM learned: %s → conn %d", eth.SourceAddress(), id)
+	} else if oldID != id {
 		log.Infof("MAC %s migrated from conn %d to conn %d",
 			eth.SourceAddress(), oldID, id)
 	}
@@ -297,16 +302,23 @@ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
 		})
 	}
 
-	if eth.DestinationAddress() != e.gateway.LinkAddress() {
+	dst := eth.DestinationAddress()
+	gwMAC := e.gateway.LinkAddress()
+	if dst != gwMAC {
+		log.Debugf("L2 switch: src=%s dst=%s (gateway=%s) → forwarding via CAM",
+			eth.SourceAddress(), dst, gwMAC)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(buf),
 		})
 		if err := e.tx(pkt); err != nil {
-			log.Error(err)
+			log.Errorf("L2 switch: tx error: %s", err)
 		}
 		pkt.DecRef()
+	} else {
+		log.Debugf("L2 switch: src=%s dst=%s → gateway (dst matches gateway MAC)",
+			eth.SourceAddress(), dst)
 	}
-	if eth.DestinationAddress() == e.gateway.LinkAddress() || eth.DestinationAddress() == header.EthernetBroadcastAddress {
+	if dst == gwMAC || dst == header.EthernetBroadcastAddress {
 		data := buffer.MakeWithData(buf)
 		data.TrimFront(header.EthernetMinimumSize)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
