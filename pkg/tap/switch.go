@@ -393,6 +393,11 @@ func fixL4Checksum(buf []byte) {
 		return
 	}
 
+	// Skip non-first IP fragments — they have no transport header.
+	if ip.FragmentOffset() != 0 {
+		return
+	}
+
 	l4Buf := ipBuf[hdrLen:]
 	l4Len := uint16(len(l4Buf))
 	srcAddr := ip.SourceAddress()
@@ -404,12 +409,15 @@ func fixL4Checksum(buf []byte) {
 			return
 		}
 		tcp := header.TCP(l4Buf)
+		dataOffset := int(tcp.DataOffset())
+		if dataOffset < header.TCPMinimumSize || dataOffset > len(l4Buf) {
+			return
+		}
 		tcp.SetChecksum(0)
-		dataOffset := tcp.DataOffset()
 		payload := l4Buf[dataOffset:]
 		psum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, srcAddr, dstAddr, l4Len)
 		psum = checksum.Checksum(payload, psum)
-		tcp.SetChecksum(tcp.CalculateChecksum(psum))
+		tcp.SetChecksum(^tcp.CalculateChecksum(psum))
 
 	case header.UDPProtocolNumber:
 		if len(l4Buf) < header.UDPMinimumSize {
@@ -420,9 +428,9 @@ func fixL4Checksum(buf []byte) {
 		payload := l4Buf[header.UDPMinimumSize:]
 		psum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcAddr, dstAddr, l4Len)
 		psum = checksum.Checksum(payload, psum)
-		xsum := udp.CalculateChecksum(psum)
+		xsum := ^udp.CalculateChecksum(psum)
 		if xsum == 0 {
-			xsum = 0xffff // RFC 768: zero checksum means "no checksum", use 0xffff
+			xsum = 0xffff // RFC 768: zero means "no checksum", use 0xffff
 		}
 		udp.SetChecksum(xsum)
 	}

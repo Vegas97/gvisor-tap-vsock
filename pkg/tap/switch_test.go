@@ -256,7 +256,6 @@ func TestFixL4Checksum_TCP(t *testing.T) {
 	tcp[16] = 0x14 // bogus partial checksum = 0x1433
 	tcp[17] = 0x33
 
-	// Save the bad checksum for comparison
 	badCsum := uint16(tcp[16])<<8 | uint16(tcp[17])
 
 	fixL4Checksum(frame)
@@ -270,16 +269,70 @@ func TestFixL4Checksum_TCP(t *testing.T) {
 		t.Error("checksum should not be zero after recomputation")
 	}
 
-	// Verify the checksum is actually correct by recomputing independently
-	tcpip.AddrFrom4([4]byte{10, 0, 0, 2})
+	// The real test: use gvisor's own IsChecksumValid to verify correctness.
+	// This is the same validation the destination VM's kernel performs.
 	srcAddr := tcpip.AddrFrom4([4]byte{10, 0, 0, 2})
 	dstAddr := tcpip.AddrFrom4([4]byte{10, 0, 0, 3})
 	tcpHdr := header.TCP(tcp)
-	tcpHdr.SetChecksum(0)
-	psum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, srcAddr, dstAddr, 20)
-	expected := tcpHdr.CalculateChecksum(psum)
-	if newCsum != expected {
-		t.Errorf("checksum mismatch: got 0x%04x, expected 0x%04x", newCsum, expected)
+	if !tcpHdr.IsChecksumValid(srcAddr, dstAddr, 0, 0) {
+		t.Errorf("checksum 0x%04x is not valid per IsChecksumValid (RFC verification)", newCsum)
+	}
+}
+
+func TestFixL4Checksum_TCP_BadDataOffset(t *testing.T) {
+	// A malformed packet with DataOffset > buffer length must not panic.
+	frame := make([]byte, 54)
+	frame[12] = 0x08 // IPv4
+	frame[13] = 0x00
+	ip := frame[14:]
+	ip[0] = 0x45       // IHL=5
+	ip[2] = 0x00       // total length = 40
+	ip[3] = 0x28
+	ip[9] = 0x06       // TCP
+	copy(ip[12:16], []byte{10, 0, 0, 2})
+	copy(ip[16:20], []byte{10, 0, 0, 3})
+
+	tcp := frame[34:]
+	tcp[12] = 0xf0 // data offset = 15 → 60 bytes (but only 20 bytes of L4 data)
+	tcp[13] = 0x02
+
+	original := make([]byte, len(frame))
+	copy(original, frame)
+
+	fixL4Checksum(frame) // must not panic
+
+	// Frame should be unchanged (function bailed out)
+	for i := range frame {
+		if frame[i] != original[i] {
+			t.Fatalf("malformed frame was modified at byte %d", i)
+		}
+	}
+}
+
+func TestFixL4Checksum_IPFragment(t *testing.T) {
+	// Non-first IP fragments have no transport header — must not be touched.
+	frame := make([]byte, 54)
+	frame[12] = 0x08 // IPv4
+	frame[13] = 0x00
+	ip := frame[14:]
+	ip[0] = 0x45       // IHL=5
+	ip[2] = 0x00       // total length = 40
+	ip[3] = 0x28
+	ip[6] = 0x00       // flags + fragment offset (high bits)
+	ip[7] = 0x10       // fragment offset = 16 (non-zero → not first fragment)
+	ip[9] = 0x06       // TCP
+	copy(ip[12:16], []byte{10, 0, 0, 2})
+	copy(ip[16:20], []byte{10, 0, 0, 3})
+
+	original := make([]byte, len(frame))
+	copy(original, frame)
+
+	fixL4Checksum(frame) // should skip — no transport header
+
+	for i := range frame {
+		if frame[i] != original[i] {
+			t.Fatalf("IP fragment was modified at byte %d", i)
+		}
 	}
 }
 
