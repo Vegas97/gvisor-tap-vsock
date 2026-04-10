@@ -7,9 +7,19 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
+
+// mockGateway implements VirtualDevice for testing.
+type mockGateway struct {
+	mac tcpip.LinkAddress
+}
+
+func (m *mockGateway) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, _ *stack.PacketBuffer) {}
+func (m *mockGateway) LinkAddress() tcpip.LinkAddress                                            { return m.mac }
+func (m *mockGateway) IP() string                                                                { return "10.0.0.1" }
 
 // mockConn implements net.Conn with a controllable Write.
 type mockConn struct {
@@ -139,6 +149,74 @@ func TestBroadcast_SkipsSourceConn(t *testing.T) {
 	if len(conn1.written) != 1 {
 		t.Errorf("conn1: expected 1 write, got %d", len(conn1.written))
 	}
+}
+
+func TestRxBuf_MACMigration_UpdatesCAM(t *testing.T) {
+	// When a VM is destroyed and recreated with the same MAC,
+	// rxBuf should update the CAM to point to the new connection.
+	// The old connection is NOT proactively killed (that would enable
+	// MAC-spoofing attacks); it cleans up via its own goroutine lifecycle.
+
+	sw := NewSwitch(false)
+	sw.gateway = &mockGateway{mac: tcpip.LinkAddress("\x02\x00\x00\x00\x00\x01")}
+
+	bessProto := &bessProtocol{}
+	sw.conns[0] = protocolConn{Conn: &mockConn{}, protocolImpl: bessProto}
+	sw.conns[1] = protocolConn{Conn: &mockConn{}, protocolImpl: bessProto}
+	sw.nextConnID = 2
+
+	mac := tcpip.LinkAddress("\x02\x00\x00\x00\x00\x02")
+	sw.cam[mac] = 0 // first-boot CAM entry
+
+	// Packet arrives from the new connection (conn 1) with the same MAC
+	frame := make([]byte, header.EthernetMinimumSize)
+	copy(frame[0:6], header.EthernetBroadcastAddress)
+	copy(frame[6:12], []byte(mac))
+	frame[12] = 0x08
+	frame[13] = 0x00
+
+	sw.rxBuf(nil, 1, frame)
+
+	// CAM should now point to the new connection
+	sw.camLock.RLock()
+	camID, ok := sw.cam[mac]
+	sw.camLock.RUnlock()
+	if !ok {
+		t.Fatal("CAM entry for MAC should exist")
+	}
+	if camID != 1 {
+		t.Errorf("CAM should point to new conn 1, got %d", camID)
+	}
+
+	// Old connection should still exist (cleaned up by its own goroutine)
+	sw.connLock.Lock()
+	_, oldExists := sw.conns[0]
+	sw.connLock.Unlock()
+	if !oldExists {
+		t.Error("old conn 0 should still exist (not proactively killed)")
+	}
+}
+
+func TestDisconnect_Idempotent(t *testing.T) {
+	// disconnect() should be safe to call twice for the same connection.
+	// This happens when txBuf error cleanup races with Accept's deferred disconnect.
+
+	sw := NewSwitch(false)
+
+	conn := &mockConn{}
+	bessProto := &bessProtocol{}
+	sw.conns[0] = protocolConn{Conn: conn, protocolImpl: bessProto}
+	sw.cam[tcpip.LinkAddress("\x02\x00\x00\x00\x00\x02")] = 0
+
+	// First disconnect — should clean up
+	sw.disconnect(0, conn)
+
+	if _, ok := sw.conns[0]; ok {
+		t.Error("conn 0 should be removed after first disconnect")
+	}
+
+	// Second disconnect — should be a no-op, not panic or double-close
+	sw.disconnect(0, conn) // must not panic
 }
 
 func TestUnicast_StillReturnsErrorOnFailure(t *testing.T) {

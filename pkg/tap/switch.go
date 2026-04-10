@@ -193,6 +193,13 @@ func (e *Switch) txBuf(id int, conn protocolConn, buf []byte) error {
 }
 
 func (e *Switch) disconnect(id int, conn net.Conn) {
+	// Guard: if the connection was already removed (e.g. by txBuf error
+	// cleanup racing with Accept's deferred disconnect), skip the
+	// double-close.
+	if _, ok := e.conns[id]; !ok {
+		return
+	}
+
 	e.camLock.Lock()
 	defer e.camLock.Unlock()
 
@@ -274,11 +281,16 @@ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
 	eth := header.Ethernet(buf)
 
 	e.camLock.Lock()
-	_, exists := e.cam[eth.SourceAddress()]
+	oldID, exists := e.cam[eth.SourceAddress()]
 	e.cam[eth.SourceAddress()] = id
 	e.camLock.Unlock()
 
-	if !exists && e.notificationSender != nil {
+	if exists && oldID != id {
+		log.Infof("MAC %s migrated from conn %d to conn %d",
+			eth.SourceAddress(), oldID, id)
+	}
+
+	if (!exists || (exists && oldID != id)) && e.notificationSender != nil {
 		e.notificationSender.Send(types.NotificationMessage{
 			NotificationType: types.ConnectionEstablished,
 			MacAddress:       eth.SourceAddress().String(),
