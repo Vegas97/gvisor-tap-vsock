@@ -4,7 +4,9 @@ import (
 	"errors"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -435,6 +437,180 @@ func TestFixL4Checksum_FirstFragment(t *testing.T) {
 			t.Fatalf("first fragment was modified at byte %d: want 0x%02x, got 0x%02x",
 				i, original[i], frame[i])
 		}
+	}
+}
+
+// enobufsConn returns ENOBUFS for the first N writes, then succeeds.
+// If failForever is true, it always returns ENOBUFS.
+type enobufsConn struct {
+	net.Conn
+	failCount   int
+	failForever bool
+	writes      int
+}
+
+func (c *enobufsConn) Write(b []byte) (int, error) {
+	c.writes++
+	if c.failForever || c.writes <= c.failCount {
+		return 0, syscall.ENOBUFS
+	}
+	return len(b), nil
+}
+func (c *enobufsConn) Close() error { return nil }
+func (c *enobufsConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+func (c *enobufsConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+func TestTxBuf_ENOBUFS_BoundedRetry(t *testing.T) {
+	t.Run("transient_clears", func(t *testing.T) {
+		// ENOBUFS for 3 writes then succeeds — should deliver
+		sw := NewSwitch(false)
+		conn := &enobufsConn{failCount: 3}
+		bessProto := &bessProtocol{}
+		pc := protocolConn{Conn: conn, protocolImpl: bessProto}
+		sw.connLock.Lock()
+		sw.conns[0] = pc
+		sw.connLock.Unlock()
+
+		err := sw.txBuf(0, pc, []byte("hello"))
+		if err != nil {
+			t.Fatalf("expected successful write after transient ENOBUFS, got: %v", err)
+		}
+		// Should have attempted 4 writes total (3 fail + 1 success)
+		if conn.writes != 4 {
+			t.Errorf("expected 4 write attempts, got %d", conn.writes)
+		}
+	})
+
+	t.Run("exhausted_retries", func(t *testing.T) {
+		// ENOBUFS forever — must NOT hang, should return error
+		sw := NewSwitch(false)
+		conn := &enobufsConn{failForever: true}
+		bessProto := &bessProtocol{}
+		pc := protocolConn{Conn: conn, protocolImpl: bessProto}
+		sw.connLock.Lock()
+		sw.conns[0] = pc
+		sw.connLock.Unlock()
+
+		done := make(chan error, 1)
+		go func() {
+			done <- sw.txBuf(0, pc, []byte("hello"))
+		}()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("expected error after exhausted retries, got nil")
+			}
+			if !errors.Is(err, syscall.ENOBUFS) {
+				t.Fatalf("expected ENOBUFS error, got: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("txBuf hung on persistent ENOBUFS — bounded retry not working")
+		}
+
+		// Connection should have been disconnected
+		sw.connLock.Lock()
+		_, exists := sw.conns[0]
+		sw.connLock.Unlock()
+		if exists {
+			t.Error("conn 0 should have been removed after exhausted ENOBUFS retries")
+		}
+	})
+}
+
+func TestRxBuf_SkipsCAMUpdate_AfterDisconnect(t *testing.T) {
+	// If a connection has been disconnected (removed from conns),
+	// rxBuf must NOT re-insert a CAM entry pointing to the dead conn ID.
+
+	sw := NewSwitch(false)
+	sw.gateway = &mockGateway{mac: tcpip.LinkAddress("\x02\x00\x00\x00\x00\x01")}
+
+	bessProto := &bessProtocol{}
+	sw.conns[0] = protocolConn{Conn: &mockConn{}, protocolImpl: bessProto}
+
+	srcMAC := tcpip.LinkAddress("\x02\x00\x00\x00\x00\x02")
+
+	// Simulate disconnect: remove conn 0 and its CAM entry
+	delete(sw.conns, 0)
+	delete(sw.cam, srcMAC)
+
+	// Build frame from srcMAC on conn 0 (now dead)
+	frame := make([]byte, header.EthernetMinimumSize)
+	copy(frame[0:6], []byte(sw.gateway.LinkAddress())) // dst = gateway (avoids tx path)
+	copy(frame[6:12], []byte(srcMAC))
+	frame[12] = 0x08
+	frame[13] = 0x00
+
+	sw.rxBuf(nil, 0, frame)
+
+	// CAM should NOT have re-learned srcMAC → 0
+	sw.camLock.RLock()
+	_, exists := sw.cam[srcMAC]
+	sw.camLock.RUnlock()
+	if exists {
+		t.Error("CAM should not have re-inserted entry for disconnected conn 0")
+	}
+}
+
+func TestFixL4Checksum_TCP_WithPadding(t *testing.T) {
+	// A 60-byte Ethernet frame (minimum) carrying a 40-byte IP packet
+	// has 6 bytes of trailing padding. The checksum must be computed
+	// over only the IP payload, not the padding.
+
+	// Build: Ethernet(14) + IPv4(20) + TCP(20) + Padding(6) = 60 bytes
+	frame := make([]byte, 60)
+
+	// Ethernet header
+	copy(frame[0:6], []byte{0x02, 0, 0, 0, 0, 0x03})
+	copy(frame[6:12], []byte{0x02, 0, 0, 0, 0, 0x02})
+	frame[12] = 0x08
+	frame[13] = 0x00
+
+	// IPv4 header (20 bytes) — TotalLength = 40 (NOT 46)
+	ip := frame[14:]
+	ip[0] = 0x45       // version=4, IHL=5
+	ip[1] = 0x00       // DSCP/ECN
+	ip[2] = 0x00       // total length = 40
+	ip[3] = 0x28
+	ip[8] = 0x40       // TTL
+	ip[9] = 0x06       // TCP
+	copy(ip[12:16], []byte{10, 0, 0, 2})
+	copy(ip[16:20], []byte{10, 0, 0, 3})
+
+	// TCP header (20 bytes) — SYN with bogus partial checksum
+	tcp := frame[34:]
+	tcp[0] = 0xa3 // src port 41888
+	tcp[1] = 0xc0
+	tcp[2] = 0x1f // dst port 8080
+	tcp[3] = 0x90
+	tcp[12] = 0x50 // data offset = 5
+	tcp[13] = 0x02 // SYN
+	tcp[14] = 0xff // window
+	tcp[15] = 0xff
+	tcp[16] = 0x14 // bogus checksum
+	tcp[17] = 0x33
+
+	// Padding bytes (54..59) — non-zero to trigger the bug
+	frame[54] = 0xDE
+	frame[55] = 0xAD
+	frame[56] = 0xBE
+	frame[57] = 0xEF
+	frame[58] = 0xCA
+	frame[59] = 0xFE
+
+	fixL4Checksum(frame)
+
+	// Verify with gvisor's own IsChecksumValid
+	srcAddr := tcpip.AddrFrom4([4]byte{10, 0, 0, 2})
+	dstAddr := tcpip.AddrFrom4([4]byte{10, 0, 0, 3})
+	tcpHdr := header.TCP(tcp[:20]) // only the real TCP header, no padding
+	if !tcpHdr.IsChecksumValid(srcAddr, dstAddr, 0, 0) {
+		csum := uint16(tcp[16])<<8 | uint16(tcp[17])
+		t.Errorf("checksum 0x%04x invalid — padding bytes likely included in computation", csum)
 	}
 }
 

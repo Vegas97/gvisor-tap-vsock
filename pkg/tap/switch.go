@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/notification"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
@@ -181,12 +182,14 @@ func (e *Switch) txBuf(id int, conn protocolConn, buf []byte) error {
 		conn.protocolImpl.(streamProtocol).Write(size, len(buf))
 		buf = append(size, buf...)
 	}
-	for {
+	const maxENOBUFSRetries = 5
+	for attempt := 0; ; attempt++ {
 		if _, err := conn.Write(buf); err != nil {
-			if errors.Is(err, syscall.ENOBUFS) {
-				// socket buffer can be full keep retrying sending the same data
-				// again until it works or we get a different error
+			if errors.Is(err, syscall.ENOBUFS) && attempt < maxENOBUFSRetries {
+				// Socket buffer transiently full — brief backoff before retry.
+				// Bounded to avoid holding writeLock+connLock indefinitely.
 				// https://github.com/containers/gvisor-tap-vsock/issues/367
+				time.Sleep(time.Millisecond)
 				continue
 			}
 			e.disconnect(id, conn)
@@ -293,10 +296,22 @@ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
 
 	eth := header.Ethernet(buf)
 
+	// Guard: only update CAM if this connection still exists.
+	// Without this check, a concurrent disconnect could remove conns[id],
+	// and we'd re-insert a stale CAM entry pointing to a dead connection.
+	// Lock ordering: connLock → camLock (consistent with txPkt, disconnect).
+	var oldID int
+	var exists bool
+	e.connLock.Lock()
+	if _, ok := e.conns[id]; !ok {
+		e.connLock.Unlock()
+		return
+	}
 	e.camLock.Lock()
-	oldID, exists := e.cam[eth.SourceAddress()]
+	oldID, exists = e.cam[eth.SourceAddress()]
 	e.cam[eth.SourceAddress()] = id
 	e.camLock.Unlock()
+	e.connLock.Unlock()
 
 	if !exists {
 		log.Infof("CAM learned: %s → conn %d", eth.SourceAddress(), id)
@@ -408,8 +423,12 @@ func fixL4Checksum(buf []byte) {
 		return
 	}
 
-	l4Buf := ipBuf[hdrLen:]
-	l4Len := uint16(len(l4Buf))
+	// Use IP TotalLength to exclude Ethernet padding from the L4 slice.
+	// Small packets are padded to the 60-byte Ethernet minimum — including
+	// those padding bytes in the checksum produces an invalid result.
+	totalLen := int(ip.TotalLength())
+	l4Buf := ipBuf[hdrLen:totalLen]
+	l4Len := uint16(totalLen - hdrLen)
 	srcAddr := ip.SourceAddress()
 	dstAddr := ip.DestinationAddress()
 
