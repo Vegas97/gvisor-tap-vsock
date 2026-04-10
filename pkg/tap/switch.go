@@ -305,6 +305,23 @@ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
 	dst := eth.DestinationAddress()
 	gwMAC := e.gateway.LinkAddress()
 	if dst != gwMAC {
+		// Log L2 frame details including TCP checksum for diagnostics
+		if e.debug && len(buf) > header.EthernetMinimumSize {
+			ipBuf := buf[header.EthernetMinimumSize:]
+			if len(ipBuf) > 0 && (ipBuf[0]>>4) == 4 { // IPv4
+				ihl := int(ipBuf[0]&0x0f) * 4
+				proto := ipBuf[9]
+				if proto == 6 && len(ipBuf) > ihl+17 { // TCP
+					tcpBuf := ipBuf[ihl:]
+					csum := uint16(tcpBuf[16])<<8 | uint16(tcpBuf[17])
+					srcPort := uint16(tcpBuf[0])<<8 | uint16(tcpBuf[1])
+					dstPort := uint16(tcpBuf[2])<<8 | uint16(tcpBuf[3])
+					flags := tcpBuf[13]
+					log.Debugf("L2 switch: TCP %s:%d → %s:%d flags=0x%02x csum=0x%04x len=%d",
+						eth.SourceAddress(), srcPort, dst, dstPort, flags, csum, len(buf))
+				}
+			}
+		}
 		log.Debugf("L2 switch: src=%s dst=%s (gateway=%s) → forwarding via CAM",
 			eth.SourceAddress(), dst, gwMAC)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
