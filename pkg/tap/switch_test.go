@@ -355,6 +355,89 @@ func TestFixL4Checksum_NonTCP(t *testing.T) {
 	}
 }
 
+func TestDebugParser_RuntIPv4_NoPanic(t *testing.T) {
+	// A short IPv4 frame (< 20 bytes of IP) must not panic the debug TCP parser.
+	// ipBuf[9] (protocol field) would be out of bounds without proper guard.
+
+	sw := NewSwitch(true) // debug = true
+	sw.gateway = &mockGateway{mac: tcpip.LinkAddress("\x02\x00\x00\x00\x00\x01")}
+
+	conn := &mockConn{}
+	bessProto := &bessProtocol{}
+	sw.conns[0] = protocolConn{Conn: conn, protocolImpl: bessProto}
+
+	// Ethernet(14) + 5 bytes of IPv4 (version nibble = 4, but way too short)
+	frame := make([]byte, header.EthernetMinimumSize+5)
+	copy(frame[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x03}) // dst != gateway
+	copy(frame[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}) // src
+	frame[12] = 0x08                                                // EtherType: IPv4
+	frame[13] = 0x00
+	frame[14] = 0x45 // version=4, IHL=5
+
+	// Must not panic
+	sw.rxBuf(nil, 0, frame)
+}
+
+func TestDebugParser_BadIHL_NoPanic(t *testing.T) {
+	// IHL=1 (ihl=4) is invalid — the debug parser must not index into
+	// IP header bytes as if they were TCP fields.
+
+	sw := NewSwitch(true) // debug = true
+	sw.gateway = &mockGateway{mac: tcpip.LinkAddress("\x02\x00\x00\x00\x00\x01")}
+
+	conn := &mockConn{}
+	bessProto := &bessProtocol{}
+	sw.conns[0] = protocolConn{Conn: conn, protocolImpl: bessProto}
+
+	// Ethernet(14) + 34 bytes of "IPv4" — enough for ihl(4)+17=21 check to pass
+	frame := make([]byte, header.EthernetMinimumSize+34)
+	copy(frame[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x03}) // dst != gateway
+	copy(frame[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}) // src
+	frame[12] = 0x08                                                // EtherType: IPv4
+	frame[13] = 0x00
+	frame[14] = 0x41 // version=4, IHL=1 (invalid — less than 5)
+	frame[23] = 0x06 // byte 9 of IP = protocol TCP (but ihl=4 means this is wrong offset)
+
+	// Must not panic, and ideally should not log garbage
+	sw.rxBuf(nil, 0, frame)
+}
+
+func TestFixL4Checksum_FirstFragment(t *testing.T) {
+	// First IP fragment (offset=0, MF=1) has partial payload —
+	// checksum recomputation would produce garbage. Must be skipped.
+
+	frame := make([]byte, 54)
+	frame[12] = 0x08 // IPv4
+	frame[13] = 0x00
+	ip := frame[14:]
+	ip[0] = 0x45       // IHL=5
+	ip[2] = 0x00       // total length = 40
+	ip[3] = 0x28
+	ip[6] = 0x20       // flags: MF=1, fragment offset = 0 (high byte: 0010 0000)
+	ip[7] = 0x00       // fragment offset low byte = 0
+	ip[9] = 0x06       // TCP
+	copy(ip[12:16], []byte{10, 0, 0, 2})
+	copy(ip[16:20], []byte{10, 0, 0, 3})
+
+	tcp := frame[34:]
+	tcp[12] = 0x50 // data offset = 5
+	tcp[13] = 0x02 // SYN
+	tcp[16] = 0xAB // checksum high
+	tcp[17] = 0xCD // checksum low
+
+	original := make([]byte, len(frame))
+	copy(original, frame)
+
+	fixL4Checksum(frame) // should skip — first fragment
+
+	for i := range frame {
+		if frame[i] != original[i] {
+			t.Fatalf("first fragment was modified at byte %d: want 0x%02x, got 0x%02x",
+				i, original[i], frame[i])
+		}
+	}
+}
+
 func TestUnicast_StillReturnsErrorOnFailure(t *testing.T) {
 	// Unicast behavior should NOT change — errors should still propagate
 

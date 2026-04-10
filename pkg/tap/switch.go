@@ -318,10 +318,9 @@ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
 		// Log L2 frame details including TCP checksum for diagnostics
 		if e.debug && len(buf) > header.EthernetMinimumSize {
 			ipBuf := buf[header.EthernetMinimumSize:]
-			if len(ipBuf) > 0 && (ipBuf[0]>>4) == 4 { // IPv4
+			if len(ipBuf) >= header.IPv4MinimumSize && (ipBuf[0]>>4) == 4 { // IPv4
 				ihl := int(ipBuf[0]&0x0f) * 4
-				proto := ipBuf[9]
-				if proto == 6 && len(ipBuf) > ihl+17 { // TCP
+				if ihl >= header.IPv4MinimumSize && ipBuf[9] == 6 && len(ipBuf) > ihl+17 { // TCP
 					tcpBuf := ipBuf[ihl:]
 					csum := uint16(tcpBuf[16])<<8 | uint16(tcpBuf[17])
 					srcPort := uint16(tcpBuf[0])<<8 | uint16(tcpBuf[1])
@@ -402,8 +401,10 @@ func fixL4Checksum(buf []byte) {
 		return
 	}
 
-	// Skip non-first IP fragments — they have no transport header.
-	if ip.FragmentOffset() != 0 {
+	// Skip IP fragments — non-first fragments have no transport header,
+	// and first fragments (MF=1) carry only partial payload, so recomputing
+	// the checksum would produce an invalid result for the reassembled datagram.
+	if ip.FragmentOffset() != 0 || ip.More() {
 		return
 	}
 
