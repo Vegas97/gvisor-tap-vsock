@@ -18,6 +18,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -324,6 +325,7 @@ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
 		}
 		log.Debugf("L2 switch: src=%s dst=%s (gateway=%s) → forwarding via CAM",
 			eth.SourceAddress(), dst, gwMAC)
+		fixL4Checksum(buf)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(buf),
 		})
@@ -363,4 +365,65 @@ func protocolImplementation(protocol types.Protocol) protocol {
 
 func (e *Switch) SetNotificationSender(notificationSender *notification.NotificationSender) {
 	e.notificationSender = notificationSender
+}
+
+// fixL4Checksum recomputes TCP/UDP checksums on L2-switched frames.
+// VM kernels with checksum offloading write only a partial checksum
+// (pseudo-header) and expect the NIC to finish it. In the L2 switch
+// path there is no NIC, so we must compute the full checksum before
+// forwarding to the destination VM.
+func fixL4Checksum(buf []byte) {
+	if len(buf) < header.EthernetMinimumSize+header.IPv4MinimumSize {
+		return
+	}
+
+	ethType := header.Ethernet(buf).Type()
+	if ethType != header.IPv4ProtocolNumber {
+		return // only handle IPv4 for now
+	}
+
+	ipBuf := buf[header.EthernetMinimumSize:]
+	ip := header.IPv4(ipBuf)
+	if !ip.IsValid(len(ipBuf)) {
+		return
+	}
+
+	hdrLen := int(ip.HeaderLength())
+	if hdrLen < header.IPv4MinimumSize || len(ipBuf) < hdrLen {
+		return
+	}
+
+	l4Buf := ipBuf[hdrLen:]
+	l4Len := uint16(len(l4Buf))
+	srcAddr := ip.SourceAddress()
+	dstAddr := ip.DestinationAddress()
+
+	switch ip.TransportProtocol() {
+	case header.TCPProtocolNumber:
+		if len(l4Buf) < header.TCPMinimumSize {
+			return
+		}
+		tcp := header.TCP(l4Buf)
+		tcp.SetChecksum(0)
+		dataOffset := tcp.DataOffset()
+		payload := l4Buf[dataOffset:]
+		psum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, srcAddr, dstAddr, l4Len)
+		psum = checksum.Checksum(payload, psum)
+		tcp.SetChecksum(tcp.CalculateChecksum(psum))
+
+	case header.UDPProtocolNumber:
+		if len(l4Buf) < header.UDPMinimumSize {
+			return
+		}
+		udp := header.UDP(l4Buf)
+		udp.SetChecksum(0)
+		payload := l4Buf[header.UDPMinimumSize:]
+		psum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcAddr, dstAddr, l4Len)
+		psum = checksum.Checksum(payload, psum)
+		xsum := udp.CalculateChecksum(psum)
+		if xsum == 0 {
+			xsum = 0xffff // RFC 768: zero checksum means "no checksum", use 0xffff
+		}
+		udp.SetChecksum(xsum)
+	}
 }

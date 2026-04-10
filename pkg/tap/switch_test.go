@@ -219,6 +219,89 @@ func TestDisconnect_Idempotent(t *testing.T) {
 	sw.disconnect(0, conn) // must not panic
 }
 
+func TestFixL4Checksum_TCP(t *testing.T) {
+	// Simulate a TCP SYN with a partial (pseudo-header only) checksum,
+	// as produced by a VM kernel with checksum offloading.
+
+	// Build: Ethernet(14) + IPv4(20) + TCP(20) = 54 bytes
+	frame := make([]byte, 54)
+
+	// Ethernet header
+	copy(frame[0:6], []byte{0x02, 0, 0, 0, 0, 0x03}) // dst MAC
+	copy(frame[6:12], []byte{0x02, 0, 0, 0, 0, 0x02}) // src MAC
+	frame[12] = 0x08                                    // EtherType: IPv4
+	frame[13] = 0x00
+
+	// IPv4 header (20 bytes)
+	ip := frame[14:]
+	ip[0] = 0x45       // version=4, IHL=5 (20 bytes)
+	ip[1] = 0x00       // DSCP/ECN
+	ip[2] = 0x00       // total length = 40
+	ip[3] = 0x28       //
+	ip[8] = 0x40       // TTL
+	ip[9] = 0x06       // protocol = TCP
+	copy(ip[12:16], []byte{10, 0, 0, 2}) // src IP
+	copy(ip[16:20], []byte{10, 0, 0, 3}) // dst IP
+
+	// TCP header (20 bytes) — SYN with WRONG checksum (partial/offloaded)
+	tcp := frame[34:]
+	tcp[0] = 0xa3 // src port 41888 (high byte)
+	tcp[1] = 0xc0 // src port 41888 (low byte)
+	tcp[2] = 0x1f // dst port 8080
+	tcp[3] = 0x90
+	tcp[12] = 0x50 // data offset = 5 (20 bytes)
+	tcp[13] = 0x02 // flags = SYN
+	tcp[14] = 0xff // window size
+	tcp[15] = 0xff
+	tcp[16] = 0x14 // bogus partial checksum = 0x1433
+	tcp[17] = 0x33
+
+	// Save the bad checksum for comparison
+	badCsum := uint16(tcp[16])<<8 | uint16(tcp[17])
+
+	fixL4Checksum(frame)
+
+	newCsum := uint16(tcp[16])<<8 | uint16(tcp[17])
+
+	if newCsum == badCsum {
+		t.Errorf("checksum was not recomputed: still 0x%04x", newCsum)
+	}
+	if newCsum == 0 {
+		t.Error("checksum should not be zero after recomputation")
+	}
+
+	// Verify the checksum is actually correct by recomputing independently
+	tcpip.AddrFrom4([4]byte{10, 0, 0, 2})
+	srcAddr := tcpip.AddrFrom4([4]byte{10, 0, 0, 2})
+	dstAddr := tcpip.AddrFrom4([4]byte{10, 0, 0, 3})
+	tcpHdr := header.TCP(tcp)
+	tcpHdr.SetChecksum(0)
+	psum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, srcAddr, dstAddr, 20)
+	expected := tcpHdr.CalculateChecksum(psum)
+	if newCsum != expected {
+		t.Errorf("checksum mismatch: got 0x%04x, expected 0x%04x", newCsum, expected)
+	}
+}
+
+func TestFixL4Checksum_NonTCP(t *testing.T) {
+	// ARP frame should pass through unchanged
+	frame := make([]byte, 42)
+	copy(frame[0:6], header.EthernetBroadcastAddress)
+	frame[12] = 0x08 // EtherType: ARP
+	frame[13] = 0x06
+
+	original := make([]byte, len(frame))
+	copy(original, frame)
+
+	fixL4Checksum(frame)
+
+	for i := range frame {
+		if frame[i] != original[i] {
+			t.Fatalf("ARP frame was modified at byte %d", i)
+		}
+	}
+}
+
 func TestUnicast_StillReturnsErrorOnFailure(t *testing.T) {
 	// Unicast behavior should NOT change — errors should still propagate
 
