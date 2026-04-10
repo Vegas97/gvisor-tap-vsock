@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net"
+	"runtime/debug"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -32,6 +33,11 @@ func acceptMultiple(ctx context.Context, ln net.Listener, handler func(context.C
 		}
 
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("PANIC in connection handler: %v\n%s", r, debug.Stack())
+				}
+			}()
 			if err := handler(ctx, conn); err != nil {
 				log.Errorf("connection handler error: %s", err)
 			}

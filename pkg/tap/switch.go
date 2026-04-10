@@ -265,6 +265,10 @@ loop:
 			return fmt.Errorf("cannot read size from socket: %w", err)
 		}
 		size := sProtocol.Read(sizeBuf)
+		if size < header.EthernetMinimumSize || size > 64*1024 {
+			return fmt.Errorf("invalid frame size %d from conn %d (expected %d–%d)",
+				size, id, header.EthernetMinimumSize, 64*1024)
+		}
 
 		buf := make([]byte, size)
 		_, err = io.ReadFull(reader, buf)
@@ -277,6 +281,11 @@ loop:
 }
 
 func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
+	if len(buf) < header.EthernetMinimumSize {
+		log.Debugf("dropping runt frame (%d bytes) from conn %d", len(buf), id)
+		return
+	}
+
 	if e.debug {
 		packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
 		log.Info(packet.String())
