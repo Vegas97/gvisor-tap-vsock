@@ -285,6 +285,59 @@ func TestAcceptMultiple_AcceptErrorContinues(t *testing.T) {
 	errListener.Close()
 }
 
+func TestAcceptMultiple_PersistentAcceptErrorsBackOff(t *testing.T) {
+	ln := &failingListener{calls: make(chan time.Time, 2)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- acceptMultiple(ctx, ln, func(context.Context, net.Conn) error {
+			t.Error("handler called after failed accept")
+			return nil
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("expected nil error on cancellation, got %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("accept loop did not stop during error backoff")
+		}
+	})
+
+	var attempts [2]time.Time
+	for i := range attempts {
+		select {
+		case attempts[i] = <-ln.calls:
+		case <-time.After(2 * time.Second):
+			t.Fatal("accept loop did not retry after an error")
+		}
+	}
+	if elapsed := attempts[1].Sub(attempts[0]); elapsed < 50*time.Millisecond {
+		t.Errorf("accept retried after %s; persistent errors must not cause a tight loop", elapsed)
+	}
+}
+
+type failingListener struct {
+	calls chan time.Time
+}
+
+func (l *failingListener) Accept() (net.Conn, error) {
+	select {
+	case l.calls <- time.Now():
+	default:
+	}
+	return nil, errors.New("persistent accept error")
+}
+
+func (l *failingListener) Close() error { return nil }
+
+func (l *failingListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+}
+
 // errorThenSuccessListener returns an error on first Accept, then a real conn.
 type errorThenSuccessListener struct {
 	realConn net.Conn

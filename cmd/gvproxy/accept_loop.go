@@ -5,6 +5,7 @@ import (
 	"net"
 	"runtime/debug"
 	"sync/atomic"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -32,6 +33,11 @@ func acceptMultiple(ctx context.Context, ln net.Listener, handler func(context.C
 			default:
 			}
 			log.Errorf("accept error: %s", err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(100 * time.Millisecond):
+			}
 			continue
 		}
 

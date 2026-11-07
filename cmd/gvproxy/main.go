@@ -226,11 +226,11 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
 			return os.Remove(config.Interfaces.Qemu)
 		})
 
-		go func() {
-			acceptMultiple(ctx, qemuListener, func(ctx context.Context, conn net.Conn) error {
+		g.Go(func() error {
+			return acceptMultiple(ctx, qemuListener, func(ctx context.Context, conn net.Conn) error {
 				return vn.AcceptQemu(ctx, conn)
 			})
-		}()
+		})
 	}
 
 	if config.Interfaces.Bess != "" {
@@ -248,11 +248,11 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
 			return os.Remove(config.Interfaces.Bess)
 		})
 
-		go func() {
-			acceptMultiple(ctx, bessListener, func(ctx context.Context, conn net.Conn) error {
+		g.Go(func() error {
+			return acceptMultiple(ctx, bessListener, func(ctx context.Context, conn net.Conn) error {
 				return vn.AcceptBess(ctx, conn)
 			})
-		}()
+		})
 	}
 
 	if config.Interfaces.Vfkit != "" {
