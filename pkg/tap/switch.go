@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/notification"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
@@ -18,6 +19,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -141,14 +143,15 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
 			srcID = -1
 		}
 		e.camLock.RUnlock()
+		log.Debugf("txPkt: broadcast from %s (connID=%d), flooding to %d conns", src, srcID, len(e.conns))
 		for id, conn := range e.conns {
 			if id == srcID {
 				continue
 			}
 
-			err := e.txBuf(id, conn, buf)
-			if err != nil {
-				return err
+			if err := e.txBuf(id, conn, buf); err != nil {
+				log.Errorf("broadcast write to conn %d failed: %s", id, err)
+				continue
 			}
 
 			atomic.AddUint64(&e.Sent, uint64(size))
@@ -158,9 +161,11 @@ func (e *Switch) txPkt(pkt *stack.PacketBuffer) error {
 		id, ok := e.cam[dst]
 		if !ok {
 			e.camLock.RUnlock()
+			log.Debugf("txPkt: unicast dst=%s NOT in CAM, dropping frame", dst)
 			return nil
 		}
 		e.camLock.RUnlock()
+		log.Debugf("txPkt: unicast dst=%s → conn %d", dst, id)
 		conn := e.conns[id]
 		err := e.txBuf(id, conn, buf)
 		if err != nil {
@@ -177,12 +182,14 @@ func (e *Switch) txBuf(id int, conn protocolConn, buf []byte) error {
 		conn.protocolImpl.(streamProtocol).Write(size, len(buf))
 		buf = append(size, buf...)
 	}
-	for {
+	const maxENOBUFSRetries = 5
+	for attempt := 0; ; attempt++ {
 		if _, err := conn.Write(buf); err != nil {
-			if errors.Is(err, syscall.ENOBUFS) {
-				// socket buffer can be full keep retrying sending the same data
-				// again until it works or we get a different error
+			if errors.Is(err, syscall.ENOBUFS) && attempt < maxENOBUFSRetries {
+				// Socket buffer transiently full — brief backoff before retry.
+				// Bounded to avoid holding writeLock+connLock indefinitely.
 				// https://github.com/containers/gvisor-tap-vsock/issues/367
+				time.Sleep(time.Millisecond)
 				continue
 			}
 			e.disconnect(id, conn)
@@ -193,6 +200,13 @@ func (e *Switch) txBuf(id int, conn protocolConn, buf []byte) error {
 }
 
 func (e *Switch) disconnect(id int, conn net.Conn) {
+	// Guard: if the connection was already removed (e.g. by txBuf error
+	// cleanup racing with Accept's deferred disconnect), skip the
+	// double-close.
+	if _, ok := e.conns[id]; !ok {
+		return
+	}
+
 	e.camLock.Lock()
 	defer e.camLock.Unlock()
 
@@ -254,6 +268,10 @@ loop:
 			return fmt.Errorf("cannot read size from socket: %w", err)
 		}
 		size := sProtocol.Read(sizeBuf)
+		if size < header.EthernetMinimumSize || size > 64*1024 {
+			return fmt.Errorf("invalid frame size %d from conn %d (expected %d–%d)",
+				size, id, header.EthernetMinimumSize, 64*1024)
+		}
 
 		buf := make([]byte, size)
 		_, err = io.ReadFull(reader, buf)
@@ -266,6 +284,11 @@ loop:
 }
 
 func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
+	if len(buf) < header.EthernetMinimumSize {
+		log.Debugf("dropping runt frame (%d bytes) from conn %d", len(buf), id)
+		return
+	}
+
 	if e.debug {
 		packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
 		log.Info(packet.String())
@@ -273,28 +296,71 @@ func (e *Switch) rxBuf(_ context.Context, id int, buf []byte) {
 
 	eth := header.Ethernet(buf)
 
+	// Guard: only update CAM if this connection still exists.
+	// Without this check, a concurrent disconnect could remove conns[id],
+	// and we'd re-insert a stale CAM entry pointing to a dead connection.
+	// Lock ordering: connLock → camLock (consistent with txPkt, disconnect).
+	var oldID int
+	var exists bool
+	e.connLock.Lock()
+	if _, ok := e.conns[id]; !ok {
+		e.connLock.Unlock()
+		return
+	}
 	e.camLock.Lock()
-	_, exists := e.cam[eth.SourceAddress()]
+	oldID, exists = e.cam[eth.SourceAddress()]
 	e.cam[eth.SourceAddress()] = id
 	e.camLock.Unlock()
+	e.connLock.Unlock()
 
-	if !exists && e.notificationSender != nil {
+	if !exists {
+		log.Infof("CAM learned: %s → conn %d", eth.SourceAddress(), id)
+	} else if oldID != id {
+		log.Infof("MAC %s migrated from conn %d to conn %d",
+			eth.SourceAddress(), oldID, id)
+	}
+
+	if (!exists || (exists && oldID != id)) && e.notificationSender != nil {
 		e.notificationSender.Send(types.NotificationMessage{
 			NotificationType: types.ConnectionEstablished,
 			MacAddress:       eth.SourceAddress().String(),
 		})
 	}
 
-	if eth.DestinationAddress() != e.gateway.LinkAddress() {
+	dst := eth.DestinationAddress()
+	gwMAC := e.gateway.LinkAddress()
+	if dst != gwMAC {
+		// Log L2 frame details including TCP checksum for diagnostics
+		if e.debug && len(buf) > header.EthernetMinimumSize {
+			ipBuf := buf[header.EthernetMinimumSize:]
+			if len(ipBuf) >= header.IPv4MinimumSize && (ipBuf[0]>>4) == 4 { // IPv4
+				ihl := int(ipBuf[0]&0x0f) * 4
+				if ihl >= header.IPv4MinimumSize && ipBuf[9] == 6 && len(ipBuf) > ihl+17 { // TCP
+					tcpBuf := ipBuf[ihl:]
+					csum := uint16(tcpBuf[16])<<8 | uint16(tcpBuf[17])
+					srcPort := uint16(tcpBuf[0])<<8 | uint16(tcpBuf[1])
+					dstPort := uint16(tcpBuf[2])<<8 | uint16(tcpBuf[3])
+					flags := tcpBuf[13]
+					log.Debugf("L2 switch: TCP %s:%d → %s:%d flags=0x%02x csum=0x%04x len=%d",
+						eth.SourceAddress(), srcPort, dst, dstPort, flags, csum, len(buf))
+				}
+			}
+		}
+		log.Debugf("L2 switch: src=%s dst=%s (gateway=%s) → forwarding via CAM",
+			eth.SourceAddress(), dst, gwMAC)
+		fixL4Checksum(buf)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(buf),
 		})
 		if err := e.tx(pkt); err != nil {
-			log.Error(err)
+			log.Errorf("L2 switch: tx error: %s", err)
 		}
 		pkt.DecRef()
+	} else {
+		log.Debugf("L2 switch: src=%s dst=%s → gateway (dst matches gateway MAC)",
+			eth.SourceAddress(), dst)
 	}
-	if eth.DestinationAddress() == e.gateway.LinkAddress() || eth.DestinationAddress() == header.EthernetBroadcastAddress {
+	if dst == gwMAC || dst == header.EthernetBroadcastAddress {
 		data := buffer.MakeWithData(buf)
 		data.TrimFront(header.EthernetMinimumSize)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -322,4 +388,79 @@ func protocolImplementation(protocol types.Protocol) protocol {
 
 func (e *Switch) SetNotificationSender(notificationSender *notification.NotificationSender) {
 	e.notificationSender = notificationSender
+}
+
+// fixL4Checksum recomputes TCP/UDP checksums on L2-switched frames.
+// VM kernels with checksum offloading write only a partial checksum
+// (pseudo-header) and expect the NIC to finish it. In the L2 switch
+// path there is no NIC, so we must compute the full checksum before
+// forwarding to the destination VM.
+func fixL4Checksum(buf []byte) {
+	if len(buf) < header.EthernetMinimumSize+header.IPv4MinimumSize {
+		return
+	}
+
+	ethType := header.Ethernet(buf).Type()
+	if ethType != header.IPv4ProtocolNumber {
+		return // only handle IPv4 for now
+	}
+
+	ipBuf := buf[header.EthernetMinimumSize:]
+	ip := header.IPv4(ipBuf)
+	if !ip.IsValid(len(ipBuf)) {
+		return
+	}
+
+	hdrLen := int(ip.HeaderLength())
+	if hdrLen < header.IPv4MinimumSize || len(ipBuf) < hdrLen {
+		return
+	}
+
+	// Skip IP fragments — non-first fragments have no transport header,
+	// and first fragments (MF=1) carry only partial payload, so recomputing
+	// the checksum would produce an invalid result for the reassembled datagram.
+	if ip.FragmentOffset() != 0 || ip.More() {
+		return
+	}
+
+	// Use IP TotalLength to exclude Ethernet padding from the L4 slice.
+	// Small packets are padded to the 60-byte Ethernet minimum — including
+	// those padding bytes in the checksum produces an invalid result.
+	totalLen := int(ip.TotalLength())
+	l4Buf := ipBuf[hdrLen:totalLen]
+	l4Len := uint16(totalLen - hdrLen)
+	srcAddr := ip.SourceAddress()
+	dstAddr := ip.DestinationAddress()
+
+	switch ip.TransportProtocol() {
+	case header.TCPProtocolNumber:
+		if len(l4Buf) < header.TCPMinimumSize {
+			return
+		}
+		tcp := header.TCP(l4Buf)
+		dataOffset := int(tcp.DataOffset())
+		if dataOffset < header.TCPMinimumSize || dataOffset > len(l4Buf) {
+			return
+		}
+		tcp.SetChecksum(0)
+		payload := l4Buf[dataOffset:]
+		psum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, srcAddr, dstAddr, l4Len)
+		psum = checksum.Checksum(payload, psum)
+		tcp.SetChecksum(^tcp.CalculateChecksum(psum))
+
+	case header.UDPProtocolNumber:
+		if len(l4Buf) < header.UDPMinimumSize {
+			return
+		}
+		udp := header.UDP(l4Buf)
+		udp.SetChecksum(0)
+		payload := l4Buf[header.UDPMinimumSize:]
+		psum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcAddr, dstAddr, l4Len)
+		psum = checksum.Checksum(payload, psum)
+		xsum := ^udp.CalculateChecksum(psum)
+		if xsum == 0 {
+			xsum = 0xffff // RFC 768: zero means "no checksum", use 0xffff
+		}
+		udp.SetChecksum(xsum)
+	}
 }

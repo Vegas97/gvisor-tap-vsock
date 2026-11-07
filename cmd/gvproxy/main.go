@@ -227,12 +227,9 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
 		})
 
 		g.Go(func() error {
-			conn, err := qemuListener.Accept()
-			if err != nil {
-				notificationSender.Send(types.NotificationMessage{NotificationType: types.HypervisorError})
-				return fmt.Errorf("qemu accept error: %w", err)
-			}
-			return vn.AcceptQemu(ctx, conn)
+			return acceptMultiple(ctx, qemuListener, func(ctx context.Context, conn net.Conn) error {
+				return vn.AcceptQemu(ctx, conn)
+			})
 		})
 	}
 
@@ -252,12 +249,9 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
 		})
 
 		g.Go(func() error {
-			conn, err := bessListener.Accept()
-			if err != nil {
-				notificationSender.Send(types.NotificationMessage{NotificationType: types.HypervisorError})
-				return fmt.Errorf("bess accept error: %w", err)
-			}
-			return vn.AcceptBess(ctx, conn)
+			return acceptMultiple(ctx, bessListener, func(ctx context.Context, conn net.Conn) error {
+				return vn.AcceptBess(ctx, conn)
+			})
 		})
 	}
 
